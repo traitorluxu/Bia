@@ -21,7 +21,7 @@ except Exception:
     psycopg = None
     dict_row = None
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 BIA_API_TOKEN = os.getenv("BIA_API_TOKEN", "")
 BIA_BASE_PROMPT = os.getenv("BIA_BASE_PROMPT", "You are Bia. Stay in voice.")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
