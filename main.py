@@ -6,6 +6,13 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from openai import OpenAI
 
+# Optional: local dev support (.env). Harmless on Railway.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 # Optional DB support (falls back to in-memory if DATABASE_URL isn't set)
 try:
     import psycopg
@@ -21,7 +28,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 app = FastAPI(title="Bia Gateway")
 
-# In-memory fallback (works immediately, but resets if the service restarts)
+# In-memory fallback (works immediately, but won't persist across redeploys)
 _mem_history: Dict[str, List[Dict[str, str]]] = {}
 _mem_notes: Dict[str, List[str]] = {}
 
@@ -29,7 +36,7 @@ _mem_notes: Dict[str, List[str]] = {}
 def get_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set on server")
     return OpenAI(api_key=api_key)
 
 
@@ -53,32 +60,28 @@ def db_conn():
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
-def init_db() -> None:
+def init_db():
     if not db_enabled():
         return
-
-    chat_table_sql = (
-        "CREATE TABLE IF NOT EXISTS chat_messages ("
-        " id BIGSERIAL PRIMARY KEY,"
-        " session_id TEXT NOT NULL,"
-        " role TEXT NOT NULL,"
-        " content TEXT NOT NULL,"
-        " created_at TIMESTAMPTZ DEFAULT now()"
-        ");"
-    )
-    notes_table_sql = (
-        "CREATE TABLE IF NOT EXISTS memory_notes ("
-        " id BIGSERIAL PRIMARY KEY,"
-        " session_id TEXT NOT NULL,"
-        " note TEXT NOT NULL,"
-        " created_at TIMESTAMPTZ DEFAULT now()"
-        ");"
-    )
-
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(chat_table_sql)
-            cur.execute(notes_table_sql)
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS chat_messages ("
+                "id BIGSERIAL PRIMARY KEY, "
+                "session_id TEXT NOT NULL, "
+                "role TEXT NOT NULL, "
+                "content TEXT NOT NULL, "
+                "created_at TIMESTAMPTZ DEFAULT now()"
+                ");"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS memory_notes ("
+                "id BIGSERIAL PRIMARY KEY, "
+                "session_id TEXT NOT NULL, "
+                "note TEXT NOT NULL, "
+                "created_at TIMESTAMPTZ DEFAULT now()"
+                ");"
+            )
         conn.commit()
 
 
@@ -103,11 +106,8 @@ def fetch_history(session_id: str, max_history: int) -> List[Dict[str, str]]:
         with db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT role, content "
-                    "FROM chat_messages "
-                    "WHERE session_id=%s "
-                    "ORDER BY created_at DESC "
-                    "LIMIT %s",
+                    "SELECT role, content FROM chat_messages "
+                    "WHERE session_id=%s ORDER BY created_at DESC LIMIT %s",
                     (session_id, max_history),
                 )
                 rows = cur.fetchall()
@@ -151,11 +151,7 @@ def fetch_notes(session_id: str, limit: int = 50) -> List[str]:
         with db_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT note "
-                    "FROM memory_notes "
-                    "WHERE session_id=%s "
-                    "ORDER BY created_at DESC "
-                    "LIMIT %s",
+                    "SELECT note FROM memory_notes WHERE session_id=%s ORDER BY created_at DESC LIMIT %s",
                     (session_id, limit),
                 )
                 notes = [r["note"] for r in cur.fetchall()]
@@ -166,14 +162,9 @@ def fetch_notes(session_id: str, limit: int = 50) -> List[str]:
     return notes[-limit:]
 
 
-@app.get("/")
-def root():
-    return {"ok": True, "service": "bia-gateway"}
-
-
 @app.get("/health")
 def health():
-    return {"ok": True, "db": db_enabled()}
+    return {"ok": True, "db": db_enabled(), "model": OPENAI_MODEL}
 
 
 @app.post("/chat", response_model=ChatOut)
@@ -185,7 +176,7 @@ def chat(payload: ChatIn, authorization: Optional[str] = Header(default=None)):
 
     # Command: /remember ...
     if msg.lower().startswith("/remember "):
-        note = msg[len("/remember ") :].strip()
+        note = msg[len("/remember "):].strip()
         if note:
             add_note(session_id, note)
             return ChatOut(session_id=session_id, reply="Noted.")
@@ -193,28 +184,27 @@ def chat(payload: ChatIn, authorization: Optional[str] = Header(default=None)):
 
     add_message(session_id, "user", msg)
 
-    # Build instructions + memory notes
     notes = fetch_notes(session_id)
     instructions = BIA_BASE_PROMPT
     if notes:
         instructions += "\n\nLong-term memory notes:\n" + "\n".join(f"- {n}" for n in notes)
 
-    # Build a plain-text transcript (avoids message-format headaches)
     history = fetch_history(session_id, payload.max_history)
-    transcript_lines = []
-    for m in history:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        transcript_lines.append(f"{role.upper()}: {content}")
-    transcript = "\n".join(transcript_lines)
+    if not history:
+        history = [{"role": "user", "content": msg}]
 
     client = get_client()
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        instructions=instructions,
-        input=transcript,   # input can be string or array :contentReference[oaicite:0]{index=0}
-        store=False,        # store controls server-side retention :contentReference[oaicite:1]{index=1}
-    )
+
+    try:
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            instructions=instructions,
+            input=history,
+            store=False,
+        )
+    except Exception as e:
+        # This will show up in Railway logs and helps you debug quickly
+        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {type(e).__name__}: {str(e)[:300]}")
 
     reply = (resp.output_text or "").strip() or "Got a blank response. Try again."
     add_message(session_id, "assistant", reply)
