@@ -1,0 +1,16 @@
+﻿# secrets
+.env
+*.env
+
+# python
+__pycache__/
+*.pyc
+
+# logs
+logs/
+
+# local secrets
+apikey.txt
+
+# local secrets
+apikey.txt
